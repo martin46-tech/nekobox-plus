@@ -110,7 +110,7 @@ jobs:
           keytool -genkeypair -keystore release.keystore \
             -alias "$ALIAS" -keyalg RSA -keysize 2048 -validity 10000 \
             -storepass "$PASS" -keypass "$PASS" \
-            -dname "CN=NekoBox+ CI, O=NekoBox+, C=US"
+            -dname "CN=NekoBox Plus CI, O=NekoBox Plus, C=US"
           {
             echo "KEYSTORE_BASE64=$(base64 -w0 release.keystore)"
             echo "KEYSTORE_PASS=$PASS"
