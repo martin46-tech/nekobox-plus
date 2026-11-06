@@ -41,8 +41,8 @@ jobs:
 
       - name: Restore build sources
         run: |
-          test -f NekoBoxPlus-build-sources-safe.zip
-          unzip -q -o NekoBoxPlus-build-sources-safe.zip -d .
+          test -f NekoBoxPlus-build-sources-v2.zip
+          unzip -q -o NekoBoxPlus-build-sources-v2.zip -d .
 
       # Android SDK/NDK + Docker image + several source checkouts add up
       # fast on a standard runner; reclaim space preinstalled tooling
