@@ -1,0 +1,243 @@
+name: Build NekoBox+
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        required: false
+      publish_release:
+        type: boolean
+        default: true
+    outputs:
+      version_name:
+        value: ${{ jobs.build.outputs.version_name }}
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "Create a GitHub Release for this build"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  # Bump these if a future patch set changes compileSdk/buildToolsVersion
+  # (buildSrc/Helpers.kt's setupCommon() -- current archive wants API 37 /
+  # build-tools 36.0.0) in NekoBoxForAndroid.patch.
+  ANDROID_PLATFORM: "android-37.0"
+  BUILD_TOOLS_VERSION: "36.0.0"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      version_name: ${{ steps.build.outputs.version_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      # Android SDK/NDK + Docker image + several source checkouts add up
+      # fast on a standard runner; reclaim space preinstalled tooling
+      # (.NET, Haskell, etc.) isn't using.
+      - name: Free up runner disk space
+        uses: jlumbroso/free-disk-space@main # consider pinning to a release tag
+        with:
+          tool-cache: false
+          docker-images: false
+          android: false # defaults to true and deletes /usr/local/lib/android,
+                          # which setup-android then can't recreate (EACCES)
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+
+      - name: Install Android platform + build-tools
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager --install \
+            "platforms;${{ env.ANDROID_PLATFORM }}" \
+            "build-tools;${{ env.BUILD_TOOLS_VERSION }}"
+
+      # Plain NDK-r27/28-via-sdkmanager can't link prebuilt deps like
+      # cronet-go's libcronet.a ("unknown relocation") -- cronet-go's own
+      # CI links against NDK r28 fetched this way (not via sdkmanager,
+      # whose package index can lag behind the NDK's own release channel).
+      - name: Set up Android NDK r28
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r28
+          link-to-sdk: true
+      - run: echo "ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
+
+      # Signing: buildSrc/Helpers.kt only creates a "release" signingConfig
+      # when KEYSTORE_PASS is set -- without it Gradle emits an *unsigned*
+      # APK, which can't be installed on a phone. If the keystore secrets
+      # aren't configured, generate a throwaway keystore here so the run
+      # still yields an installable APK. A throwaway key is regenerated on
+      # every run, so updating over a previous build needs an uninstall
+      # first; set the four secrets once for a stable signature instead.
+      - name: Prepare signing keystore
+        env:
+          SECRET_KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          SECRET_KEYSTORE_PASS: ${{ secrets.KEYSTORE_PASS }}
+          SECRET_ALIAS_NAME: ${{ secrets.ALIAS_NAME }}
+          SECRET_ALIAS_PASS: ${{ secrets.ALIAS_PASS }}
+        run: |
+          if [ -n "$SECRET_KEYSTORE_BASE64" ]; then
+            echo "Секрет KEYSTORE_BASE64 задан — использую его."
+            {
+              echo "KEYSTORE_BASE64=$SECRET_KEYSTORE_BASE64"
+              echo "KEYSTORE_PASS=$SECRET_KEYSTORE_PASS"
+              echo "ALIAS_NAME=$SECRET_ALIAS_NAME"
+              echo "ALIAS_PASS=$SECRET_ALIAS_PASS"
+            } >> "$GITHUB_ENV"
+            exit 0
+          fi
+          echo "KEYSTORE_BASE64 не задан — генерирую одноразовый keystore."
+          PASS="nekoboxplus"
+          ALIAS="nekoboxplus"
+          keytool -genkeypair -keystore release.keystore \
+            -alias "$ALIAS" -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass "$PASS" -keypass "$PASS" \
+            -dname "CN=NekoBox+ CI, O=NekoBox+, C=US"
+          {
+            echo "KEYSTORE_BASE64=$(base64 -w0 release.keystore)"
+            echo "KEYSTORE_PASS=$PASS"
+            echo "ALIAS_NAME=$ALIAS"
+            echo "ALIAS_PASS=$PASS"
+          } >> "$GITHUB_ENV"
+
+      - name: Build core + APKs
+        id: build
+        run: bash scripts/build-and-package.sh
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NekoBoxPlus-${{ steps.build.outputs.version_name }}
+          path: dist/*.apk
+
+      # VirusTotal scans asynchronously -- the upload only queues a file
+      # and returns an analysis id, so this polls for the actual verdict
+      # per APK rather than just confirming the upload went through.
+      # Scans all APKs (not just one) -- free API keys are capped at
+      # 4 req/min, so with all files this easily takes several minutes;
+      # every VT call is spaced 16s apart to stay under that regardless
+      # of how many files are in flight. Uploaded files aren't private --
+      # VT shares them with its paying (threat-intel) customers, so this
+      # only runs if you've deliberately added VIRUSTOTAL_API_KEY.
+      - name: Scan APKs with VirusTotal
+        if: always()
+        continue-on-error: true
+        env:
+          VT_API_KEY: ${{ secrets.VIRUSTOTAL_API_KEY }}
+        run: |
+          mapfile -t APK_PATHS < <(find dist -name '*.apk' 2>/dev/null | sort)
+
+          if [ -z "$VT_API_KEY" ]; then
+            echo "VIRUSTOTAL_API_KEY не задан — пропускаю проверку."
+            exit 0
+          fi
+          if [ "${#APK_PATHS[@]}" -eq 0 ]; then
+            echo "APK-файлы в dist/ не найдены — пропускаю проверку."
+            exit 0
+          fi
+
+          vt_call() { curl -s -w '\n%{http_code}' "$@" 2>/dev/null || echo -e "\n000"; }
+
+          declare -A ANALYSIS_ID
+          declare -A RESULTS
+
+          echo "== Отправка (${#APK_PATHS[@]} файлов) =="
+          for APK_PATH in "${APK_PATHS[@]}"; do
+            NAME=$(basename "$APK_PATH")
+            echo "-- $NAME --"
+
+            RESPONSE=$(vt_call "https://www.virustotal.com/api/v3/files/upload_url" -H "x-apikey: $VT_API_KEY")
+            HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+            BODY=$(echo "$RESPONSE" | sed '$d')
+            sleep 16
+            if [ "$HTTP_CODE" != "200" ]; then
+              echo "  ошибка upload_url (HTTP $HTTP_CODE): $BODY"
+              continue
+            fi
+            UPLOAD_URL=$(echo "$BODY" | jq -r '.data // empty')
+            if [ -z "$UPLOAD_URL" ]; then
+              echo "  пустой upload_url: $BODY"
+              continue
+            fi
+
+            UPLOAD_RESPONSE=$(vt_call -X POST "$UPLOAD_URL" -H "x-apikey: $VT_API_KEY" -F "file=@$APK_PATH")
+            UPLOAD_HTTP_CODE=$(echo "$UPLOAD_RESPONSE" | tail -1)
+            UPLOAD_BODY=$(echo "$UPLOAD_RESPONSE" | sed '$d')
+            sleep 16
+            if [ "$UPLOAD_HTTP_CODE" != "200" ]; then
+              echo "  ошибка загрузки (HTTP $UPLOAD_HTTP_CODE): $UPLOAD_BODY"
+              continue
+            fi
+            ID=$(echo "$UPLOAD_BODY" | jq -r '.data.id // empty')
+            if [ -z "$ID" ]; then
+              echo "  нет analysis id: $UPLOAD_BODY"
+              continue
+            fi
+            echo "  принят, analysis id: $ID"
+            ANALYSIS_ID["$NAME"]="$ID"
+          done
+
+          if [ "${#ANALYSIS_ID[@]}" -eq 0 ]; then
+            echo "Ни один файл не удалось поставить на анализ."
+            exit 0
+          fi
+
+          echo "== Ожидание результатов (${#ANALYSIS_ID[@]} в очереди) =="
+          for round in $(seq 1 25); do
+            ALL_DONE=1
+            for NAME in "${!ANALYSIS_ID[@]}"; do
+              [ -n "${RESULTS[$NAME]:-}" ] && continue
+              ID="${ANALYSIS_ID[$NAME]}"
+              POLL=$(curl -s "https://www.virustotal.com/api/v3/analyses/$ID" -H "x-apikey: $VT_API_KEY" 2>/dev/null || echo '{}')
+              STATUS=$(echo "$POLL" | jq -r '.data.attributes.status // empty')
+              sleep 16
+              if [ "$STATUS" = "completed" ]; then
+                MALICIOUS=$(echo "$POLL" | jq -r '.data.attributes.stats.malicious // 0')
+                SUSPICIOUS=$(echo "$POLL" | jq -r '.data.attributes.stats.suspicious // 0')
+                echo "$NAME: malicious=$MALICIOUS suspicious=$SUSPICIOUS"
+                RESULTS["$NAME"]="вредоносным: $MALICIOUS, подозрительным: $SUSPICIOUS"
+              else
+                ALL_DONE=0
+                echo "$NAME: статус ${STATUS:-?} (раунд $round)"
+              fi
+            done
+            [ "$ALL_DONE" = 1 ] && break
+          done
+
+          {
+            echo "### VirusTotal"
+            for NAME in "${!ANALYSIS_ID[@]}"; do
+              REPORT_URL="https://www.virustotal.com/gui/analysis/${ANALYSIS_ID[$NAME]}"
+              if [ -n "${RESULTS[$NAME]:-}" ]; then
+                echo "- **$NAME**: ${RESULTS[$NAME]}. [Отчёт]($REPORT_URL)"
+              else
+                echo "- **$NAME**: не завершился за отведённое время. [Проверить]($REPORT_URL)"
+              fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+
+      - name: Publish GitHub Release
+        if: inputs.publish_release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.build.outputs.version_name }}
+          name: NekoBox+ ${{ steps.build.outputs.version_name }}
+          files: dist/*.apk
