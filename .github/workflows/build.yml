@@ -39,6 +39,11 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
 
+      - name: Restore build sources
+        run: |
+          test -f NekoBoxPlus-build-sources-safe.zip
+          unzip -q -o NekoBoxPlus-build-sources-safe.zip -d .
+
       # Android SDK/NDK + Docker image + several source checkouts add up
       # fast on a standard runner; reclaim space preinstalled tooling
       # (.NET, Haskell, etc.) isn't using.
